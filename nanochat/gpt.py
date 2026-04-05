@@ -1,5 +1,4 @@
-"""
-GPT model (rewrite, a lot simpler)
+""" GPT model (rewrite, a lot simpler)
 Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
@@ -20,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW, GaLoreAdam
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -366,7 +365,12 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    # TODO (GaLore): extend setup_optimizer(...) signature with GaLore config (rank, update interval, etc.).
+    # TODO (GaLore): keep defaults such that GaLore is disabled and current optimizer behavior remains unchanged.
+    def setup_optimizer(
+        self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, 
+        optim="muon", galore_update_interval, galore_rank, galore_scale
+    ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -395,14 +399,32 @@ class GPT(nn.Module):
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
-
         Factory = DistMuonAdamW if ddp else MuonAdamW
+        match optim:
+            case "muon":
+                for shape in sorted({p.shape for p in matrix_params}):
+                    group_params = [p for p in matrix_params if p.shape == shape]
+                    param_groups.append(dict(
+                        kind='muon', params=group_params, lr=matrix_lr,
+                        momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                    ))
+            case "adam":
+                param_groups.append(dict(
+                    kind='adamw', params=matrix_params, lr=matrix_lr,
+                    betas=(0.9, 0.95), eps=1e-10, weight_decay=weight_decay
+                ))
+            case "galore":
+                for shape in sorted({p.shape for p in matrix_params}):
+                    group_params = [p for p in matrix_params if p.shape == shape]
+                    param_groups.append(dict(
+                        kind='galore_adam', params=group_params, lr=matrix_lr,
+                        betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay,
+                        rank=galore_rank, update_proj_gap=galore_update_interval, scale=galore_scale
+                    ))
+                Factory = GaLoreAdam
+                pass
+
+        # TODO (GaLore): choose GaLore-enabled optimizer Factory depending on `ddp` (single-GPU vs distributed).
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]

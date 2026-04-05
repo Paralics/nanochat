@@ -75,6 +75,11 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# GaLore
+parser.add_argument("--optim", type=str, default="muon", choices=["muon", "adam", "galore"], help="Select optimizer")
+parser.add_argument("--galore-rank", type=int, default=128, help="rank for Galore projection")
+parser.add_argument("--galore-update-interval", type=int, default=100, help="update interval for galore svd")
+parser.add_argument("--galore-scale", type=float, default=0.25, help="LR multiplier for GaLore params relative to full-rank")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -160,6 +165,7 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+    # TODO (GaLore): when resuming, inherit/validate GaLore config vs checkpoint `meta_data["user_config"]` (or fail loudly on mismatch).
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -312,6 +318,11 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    optim=args.optim,
+    # GaLore hyperparameters
+    galore_rank=args.galore_rank,
+    galore_update_interval=args.galore_update_interval,
+    galore_scale=args.galore_scale
 )
 
 if resuming:
@@ -522,6 +533,7 @@ while True:
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
+            # TODO (GaLore): include GaLore-matrix param groups in momentum/weight_decay scheduling (if GaLore introduces new `kind` values).
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:

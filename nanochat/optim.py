@@ -175,6 +175,9 @@ class MuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
+    # TODO (GaLore): extend this optimizer with GaLore support for matrix params.
+    # Specifically: add a new `kind` (e.g. 'galore_muon') and implement GaLore's low-rank gradient projection
+    # before the Muon fused update (including per-param subspace state + periodic updates).
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
@@ -256,6 +259,9 @@ class MuonAdamW(torch.optim.Optimizer):
         # Stack grads and params (NOTE: this assumes all params have the same shape)
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
+        # TODO (GaLore): if this group is GaLore-enabled, update GaLore per-param projection state (rank/subspace)
+        # on the configured interval, then replace `stacked_grads` with GaLore-projected grads (or projected update).
+        # This likely requires adding a Muon-level or param-level step counter to the state.
 
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
@@ -264,6 +270,9 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t.fill_(group["weight_decay"])
 
         # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
+        # TODO (GaLore): decide where the low-rank projection should occur in Muon's pipeline
+        # (before momentum/orthogonalization vs after), and ensure the tensors passed to `muon_step_fused(...)`
+        # match the expected shapes/dtypes.
         muon_step_fused(
             stacked_grads,
             stacked_params,
@@ -280,6 +289,89 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_galore(self, group: dict) -> None:
+        params = group['params']
+        rank = group['rank']
+        proj_gap = group['proj_gap']
+        p0 = params[0]
+        state = self.state[p0]
+        device, dtype = p0.device, p0.dtype
+
+        # Initialize GaLore state
+        if 'proj_counter' not in state:
+            state['proj_counter'] = 0
+            state['projections'] = []
+            for p in params:
+                # Row projection matrix P: (in_features, rank)
+                P = torch.zeros(p.shape[0], rank, device=device, dtype=dtype)
+                torch.nn.init.orthogonal_(P[:, :min(rank, p.shape[1])]) # Safe init
+                state['projections'].append(P)
+
+        # Periodic subspace update via SVD
+        if state['proj_counter'] % proj_gap == 0:
+            for i, p in enumerate(params):
+                if p.grad is not None:
+                    # Economy SVD for row projection
+                    u, _, _ = torch.linalg.svd(p.grad.float(), full_matrices=False)
+                    state['projections'][i] = u[:, :rank].to(dtype)
+        state['proj_counter'] += 1
+
+        # Project gradients & run Muon step in low-rank space
+        projected_grads = []
+        projected_params = []
+        proj_momentum = []
+        proj_second_mom = []
+        red_dim = -2 # We project rows, so reduce over columns (-2 -> -1 in projected space)
+
+        for i, p in enumerate(params):
+            if p.grad is None: continue
+            P = state['projections'][i]
+            G_proj = P.T @ p.grad  # (rank, out_features)
+            projected_grads.append(G_proj)
+            # Fake param buffer for Muon kernel (low-rank)
+            proj_p = torch.zeros_like(G_proj)
+            projected_params.append(proj_p)
+            
+            # Init momentum/second_mom for projected space if missing
+            if f'proj_momentum_{i}' not in state:
+                state[f'proj_momentum_{i}'] = torch.zeros_like(G_proj)
+                state[f'proj_second_mom_{i}'] = torch.zeros_like(G_proj[:, :1] if G_proj.shape[1] > G_proj.shape[0] else G_proj[:1, :])
+            proj_momentum.append(state[f'proj_momentum_{i}'])
+            proj_second_mom.append(state[f'proj_second_mom_{i}'])
+
+        if not projected_grads: return
+
+        # Stack for fused kernel
+        stacked_grads = torch.stack(projected_grads)
+        stacked_proj_p = torch.stack(projected_params)
+        stacked_mom = torch.stack(proj_momentum)
+        stacked_2mom = torch.stack(proj_second_mom)
+
+        # Fill 0-D tensors
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] or 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, stacked_grads.shape[-2] / stacked_grads.shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+
+        # Run Muon step on projected tensors
+        muon_step_fused(
+            stacked_grads, stacked_proj_p, stacked_mom, stacked_2mom,
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+            group["ns_steps"], red_dim
+        )
+
+        # Unproject updates and apply to original parameters
+        lr = self._muon_lr_t.to(dtype)
+        wd = self._muon_wd_t.to(dtype)
+        for i, p in enumerate(params):
+            if p.grad is None: continue
+            P = state['projections'][i]
+            U_proj = stacked_proj_p[i]
+            U = P @ U_proj  # Unproject to full space
+            # Cautious update + weight decay (mirrors muon_step_fused logic)
+            mask = (U * p) >= 0
+            p.sub_(lr * U + lr * wd * p * mask)
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -287,6 +379,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'galore':
+                self._step_galore(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -352,6 +446,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
     """
+    # TODO (GaLore): add distributed GaLore support by extending the distributed Muon update path.
+    # Because DistMuonAdamW shards optimizer state by rank for large tensors, ensure GaLore subspace/projection state
+    # is sharded consistently and survives save/load via `optimizer.state_dict()`.
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
@@ -480,6 +577,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
+            # TODO (GaLore): apply GaLore gradient projection to `grad_chunk[:num_owned]` (or compute projected update)
+            # using GaLore's periodic subspace update interval; keep in mind each rank owns only a subset of params.
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
@@ -516,6 +615,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
+            # TODO (GaLore): extend reduce/compute branching for GaLore matrix groups (if GaLore needs different comm).
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -526,8 +626,111 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
+            # TODO (GaLore): route GaLore matrix groups into GaLore-projected update logic.
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+class GaLoreAdam(torch.optim.Optimizer):
+    """
+    Combined optimizer: GaLore-Adam for 2D matrix params, standard AdamW for others.
+    Projects gradients onto a low-rank subspace to save memory, updates via fused AdamW,
+    then unprojects the update back to full parameter space.
+    """
+    def __init__(self, param_groups: list[dict]):
+        super().__init__(param_groups, defaults={})
+        # 0-D CPU tensors to avoid torch.compile recompilation
+        self._step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+
+    def _step_galore(self, group: dict) -> None:
+        rank = group.get('rank', 128)
+        update_proj_gap = group.get('update_proj_gap', 200)
+        scale = group.get('scale', 0.25)
+        betas = group.get('betas', (0.9, 0.999))
+
+        for p in group['params']:
+            if p.grad is None: continue
+            grad = p.grad
+            state = self.state[p]
+
+            # Lazy init
+            if not state:
+                state['step'] = 0
+                # Projection matrix shape: (n_features, rank)
+                state['proj'] = torch.empty(p.shape[-1], rank, dtype=p.dtype, device=p.device)
+                state['exp_avg'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
+                state['exp_avg_sq'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
+                state['proj_last_step'] = -update_proj_gap  # force first-step update
+
+            proj = state['proj']
+            exp_avg = state['exp_avg']
+            exp_avg_sq = state['exp_avg_sq']
+            state['step'] += 1
+
+            # 1) Update projection subspace periodically
+            if state['step'] % update_proj_gap == 0:
+                # SVD on gradient to get top-k right singular vectors
+                _, _, V = torch.linalg.svd(grad.float(), full_matrices=False)
+                proj.data.copy_(V.T[:, :rank].to(p.dtype))
+                state['proj_last_step'] = state['step']
+
+            # 2) Project gradient: g_low = grad @ proj  -> (m, rank)
+            g_low = torch.matmul(grad, proj)
+
+            # 3) Run AdamW in low-rank space
+            self._step_t.fill_(state['step'])
+            self._lr_t.fill_(group['lr'])
+            self._beta1_t.fill_(betas[0])
+            self._beta2_t.fill_(betas[1])
+            self._eps_t.fill_(group.get('eps', 1e-8))
+            self._wd_t.fill_(group.get('weight_decay', 0.0))
+
+            adamw_step_fused(
+                proj, g_low, exp_avg, exp_avg_sq,  # Note: proj is updated in-place as "parameter"
+                self._step_t, self._lr_t, self._beta1_t,
+                self._beta2_t, self._eps_t, self._wd_t
+            )
+
+            # 4) Unproject update and apply to full parameter: p -= scale * proj @ proj.T
+            # We compute the full-rank update explicitly
+            update_full = torch.matmul(proj, proj.T)  # (m, n)
+            p.data.add_(update_full, alpha=-scale * group['lr'])
+
+    def _step_adamw(self, group: dict) -> None:
+        # Reuse existing AdamW logic
+        from nanochat.optim import adamw_step_fused  # ensure import works if called standalone
+        for p in group['params']:
+            if p.grad is None: continue
+            grad = p.grad
+            state = self.state[p]
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            state['step'] += 1
+            self._step_t.fill_(state['step'])
+            self._lr_t.fill_(group['lr'])
+            self._beta1_t.fill_(group['betas'][0])
+            self._beta2_t.fill_(group['betas'][1])
+            self._eps_t.fill_(group['eps'])
+            self._wd_t.fill_(group['weight_decay'])
+            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
+                             self._step_t, self._lr_t, self._beta1_t,
+                             self._beta2_t, self._eps_t, self._wd_t)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group['kind'] == 'galore_adam':
+                self._step_galore(group)
+            elif group['kind'] == 'adamw':
+                self._step_adamw(group)
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
