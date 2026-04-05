@@ -369,7 +369,7 @@ class GPT(nn.Module):
     # TODO (GaLore): keep defaults such that GaLore is disabled and current optimizer behavior remains unchanged.
     def setup_optimizer(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, 
-        optim="muon", galore_update_interval, galore_rank, galore_scale
+        optim="muon", galore_update_interval=None, galore_rank=None, galore_scale=None
     ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
