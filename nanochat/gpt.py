@@ -399,7 +399,6 @@ class GPT(nn.Module):
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
-        Factory = DistMuonAdamW if ddp else MuonAdamW
         match optim:
             case "muon":
                 for shape in sorted({p.shape for p in matrix_params}):
@@ -421,10 +420,13 @@ class GPT(nn.Module):
                         betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay,
                         rank=galore_rank, update_proj_gap=galore_update_interval, scale=galore_scale
                     ))
+        match optim, ddp:
+            case "galore", _:
                 Factory = GaLoreAdam
-                pass
-
-        # TODO (GaLore): choose GaLore-enabled optimizer Factory depending on `ddp` (single-GPU vs distributed).
+            case _, False:
+                Factory = MuonAdamW
+            case _, _:
+                Factory = DistMuonAdamW
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
