@@ -289,88 +289,6 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
-    def _step_galore(self, group: dict) -> None:
-        params = group['params']
-        rank = group['rank']
-        proj_gap = group['proj_gap']
-        p0 = params[0]
-        state = self.state[p0]
-        device, dtype = p0.device, p0.dtype
-
-        # Initialize GaLore state
-        if 'proj_counter' not in state:
-            state['proj_counter'] = 0
-            state['projections'] = []
-            for p in params:
-                # Row projection matrix P: (in_features, rank)
-                P = torch.zeros(p.shape[0], rank, device=device, dtype=dtype)
-                torch.nn.init.orthogonal_(P[:, :min(rank, p.shape[1])]) # Safe init
-                state['projections'].append(P)
-
-        # Periodic subspace update via SVD
-        if state['proj_counter'] % proj_gap == 0:
-            for i, p in enumerate(params):
-                if p.grad is not None:
-                    # Economy SVD for row projection
-                    u, _, _ = torch.linalg.svd(p.grad.float(), full_matrices=False)
-                    state['projections'][i] = u[:, :rank].to(dtype)
-        state['proj_counter'] += 1
-
-        # Project gradients & run Muon step in low-rank space
-        projected_grads = []
-        projected_params = []
-        proj_momentum = []
-        proj_second_mom = []
-        red_dim = -2 # We project rows, so reduce over columns (-2 -> -1 in projected space)
-
-        for i, p in enumerate(params):
-            if p.grad is None: continue
-            P = state['projections'][i]
-            G_proj = P.T @ p.grad  # (rank, out_features)
-            projected_grads.append(G_proj)
-            # Fake param buffer for Muon kernel (low-rank)
-            proj_p = torch.zeros_like(G_proj)
-            projected_params.append(proj_p)
-            
-            # Init momentum/second_mom for projected space if missing
-            if f'proj_momentum_{i}' not in state:
-                state[f'proj_momentum_{i}'] = torch.zeros_like(G_proj)
-                state[f'proj_second_mom_{i}'] = torch.zeros_like(G_proj[:, :1] if G_proj.shape[1] > G_proj.shape[0] else G_proj[:1, :])
-            proj_momentum.append(state[f'proj_momentum_{i}'])
-            proj_second_mom.append(state[f'proj_second_mom_{i}'])
-
-        if not projected_grads: return
-
-        # Stack for fused kernel
-        stacked_grads = torch.stack(projected_grads)
-        stacked_proj_p = torch.stack(projected_params)
-        stacked_mom = torch.stack(proj_momentum)
-        stacked_2mom = torch.stack(proj_second_mom)
-
-        # Fill 0-D tensors
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] or 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, stacked_grads.shape[-2] / stacked_grads.shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-
-        # Run Muon step on projected tensors
-        muon_step_fused(
-            stacked_grads, stacked_proj_p, stacked_mom, stacked_2mom,
-            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-            group["ns_steps"], red_dim
-        )
-
-        # Unproject updates and apply to original parameters
-        lr = self._muon_lr_t.to(dtype)
-        wd = self._muon_wd_t.to(dtype)
-        for i, p in enumerate(params):
-            if p.grad is None: continue
-            P = state['projections'][i]
-            U_proj = stacked_proj_p[i]
-            U = P @ U_proj  # Unproject to full space
-            # Cautious update + weight decay (mirrors muon_step_fused logic)
-            mask = (U * p) >= 0
-            p.sub_(lr * U + lr * wd * p * mask)
 
     @torch.no_grad()
     def step(self):
@@ -379,8 +297,6 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
-            elif group['kind'] == 'galore':
-                self._step_galore(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -685,13 +601,14 @@ class GaLoreAdam(torch.optim.Optimizer):
             if p.grad is None: continue
             grad = p.grad
             state = self.state[p]
-
             if not state:
                 state['step'] = 0
-                state['proj'] = torch.empty(p.shape[-1], rank, dtype=p.dtype, device=p.device)
+                # Initialize with a random orthogonal matrix or identity slice
+                P = torch.randn(p.shape[-1], rank, dtype=p.dtype, device=p.device)
+                state['proj'] = torch.linalg.qr(P).Q
                 state['exp_avg'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
-                state['exp_avg_sq'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
-                state['proj_last_step'] = -update_proj_gap
+                state['exp_avg_sq'] = torch.zeros_like(state['exp_avg'])
+                state['proj_last_step'] = 0 
 
             proj = state['proj']
             exp_avg = state['exp_avg']
@@ -707,7 +624,7 @@ class GaLoreAdam(torch.optim.Optimizer):
 
             # 2) Fused low-rank AdamW step
             self._step_t.fill_(state['step'])
-            self._lr_t.fill_(group['lr'])
+            self._lr_t.fill_(group['lr'] * scale)
             self._beta1_t.fill_(betas[0])
             self._beta2_t.fill_(betas[1])
             self._eps_t.fill_(group.get('eps', 1e-8))
@@ -718,12 +635,6 @@ class GaLoreAdam(torch.optim.Optimizer):
                 self._step_t, self._lr_t, self._beta1_t,
                 self._beta2_t, self._eps_t, self._wd_t
             )
-
-            # 3) Apply GaLore scale factor to the full parameter update
-            # The fused step already applied the update, so we scale it post-hoc
-            # Alternatively, we could pass scale into the kernel. For simplicity:
-            if scale != 1.0:
-                p.data.mul_(scale)
 
     def _step_adamw(self, group: dict) -> None:
         for p in group['params']:
