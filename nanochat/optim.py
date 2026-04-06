@@ -49,28 +49,7 @@ def adamw_step_fused(
 """
 Muon optimizer adapted and simplified from modded-nanogpt.
 https://github.com/KellerJordan/modded-nanogpt
-Background:
-Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-zero even beyond the point where the iteration no longer converges all the way to one everywhere
-on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-performance at all relative to UV^T, where USV^T = G is the SVD.
-Here, an alternative to Newton-Schulz iteration with potentially better convergence properties:
-Polar Express Sign Method for orthogonalization.
-https://arxiv.org/pdf/2505.16932
-by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
-NorMuon variance reduction: per-neuron/column adaptive learning rate that normalizes
-update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
-https://arxiv.org/pdf/2510.05492
-Some of the changes in nanochat implementation:
-Uses a simpler, more general approach to parameter grouping and stacking
-Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
-Makes no assumptions about model architecture (e.g. that attention weights are fused into QKVO format)
 """
-# Coefficients for Polar Express (computed for num_iters=5, safety_factor=2e-2, cushion=2)
-# From https://arxiv.org/pdf/2505.16932
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
@@ -92,17 +71,11 @@ def muon_step_fused(
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
 ) -> None:
-    """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
-    """
-    # Nesterov momentum
+    """Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update"""
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
     if g.size(-2) > g.size(-1): # Tall matrix
@@ -117,7 +90,6 @@ def muon_step_fused(
             X = a * X + B @ X
     g = X
 
-    # Variance reduction
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
@@ -130,25 +102,16 @@ def muon_step_fused(
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
 
-    # Cautious weight decay + parameter update
     lr = lr_t.to(g.dtype)
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
-# Single GPU version of the MuonAdamW optimizer.
-# Used mostly for reference, debugging and testing.
 class MuonAdamW(torch.optim.Optimizer):
-    """
-    Combined optimizer: Muon for 2D matrix params, AdamW for others, single GPU version.
-    AdamW - Fused AdamW optimizer step.
-    Muon - MomentUm Orthogonalized by Newton-schulz
-    https://kellerjordan.github.io/posts/muon/
-    """
+    """Combined optimizer: Muon for 2D matrix params, AdamW for others, single GPU version."""
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -222,12 +185,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
 # -----------------------------------------------------------------------------
-# Distributed version of the MuonAdamW optimizer.
 class DistMuonAdamW(torch.optim.Optimizer):
-    """
-    Combined distributed optimizer: Muon for 2D matrix params, AdamW for others.
-    See MuonAdamW for the algorithmic details of each optimizer.
-    """
+    """Combined distributed optimizer: Muon for 2D matrix params, AdamW for others."""
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -412,28 +371,33 @@ class GaLoreAdam(torch.optim.Optimizer):
             state = self.state[p]
 
             if not state:
+                # FIX: Safely cap rank to matrix dimensions to prevent QR shape collapse
+                eff_rank = min(rank, p.shape[0], p.shape[-1])
+                state['rank'] = eff_rank
                 state['step'] = 0
-                # FIX 1: Initialize projection with a valid orthogonal matrix instead of garbage
-                P = torch.randn(p.shape[-1], rank, dtype=p.dtype, device=p.device)
-                state['proj'], _ = torch.linalg.qr(P)
-                state['exp_avg'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
-                state['exp_avg_sq'] = torch.zeros(p.shape[0], rank, dtype=p.dtype, device=p.device)
+                # Safe orthogonal initialization
+                P = torch.empty(p.shape[-1], eff_rank, dtype=p.dtype, device=p.device)
+                torch.nn.init.orthogonal_(P)
+                state['proj'] = P
+                state['exp_avg'] = torch.zeros(p.shape[0], eff_rank, dtype=p.dtype, device=p.device)
+                state['exp_avg_sq'] = torch.zeros(p.shape[0], eff_rank, dtype=p.dtype, device=p.device)
                 state['proj_last_step'] = 0
 
             proj = state['proj']
             exp_avg = state['exp_avg']
             exp_avg_sq = state['exp_avg_sq']
+            eff_rank = state['rank']
             state['step'] += 1
 
-            # 1) Update projection subspace periodically via SVD
+            # Update projection subspace periodically via SVD
             if state['step'] % update_proj_gap == 0:
                 _, _, Vh = torch.linalg.svd(grad.float(), full_matrices=False)
-                proj.data.copy_(Vh.T[:, :rank].to(p.dtype))
+                proj.data.copy_(Vh.T[:, :eff_rank].to(p.dtype))
                 state['proj_last_step'] = state['step']
 
-            # 2) Fused low-rank AdamW step
+            # Fused low-rank AdamW step
             self._step_t.fill_(state['step'])
-            # FIX 2: Apply scale to LR, NOT to the parameter tensor
+            # FIX: Apply scale to LR, NOT to the parameter tensor
             self._lr_t.fill_(group['lr'] * scale)
             self._beta1_t.fill_(betas[0])
             self._beta2_t.fill_(betas[1])
@@ -523,12 +487,15 @@ class DistGaLoreAdamW(torch.optim.Optimizer):
             for i, param in enumerate(owned_params):
                 state = self.state[param]
                 if not state:
+                    # FIX: Safely cap rank to matrix dimensions
+                    eff_rank = min(group.get('rank', 128), shape[0], shape[-1])
+                    state['rank'] = eff_rank
                     state['step'] = 0
-                    # FIX 1: Proper orthogonal initialization
-                    P = torch.randn(shape[-1], group.get('rank', 128), device=device, dtype=dtype)
-                    state['proj'], _ = torch.linalg.qr(P)
-                    state['exp_avg'] = torch.zeros(shape[0], group.get('rank', 128), dtype=dtype, device=device)
-                    state['exp_avg_sq'] = torch.zeros(shape[0], group.get('rank', 128), dtype=dtype, device=device)
+                    P = torch.empty(shape[-1], eff_rank, device=device, dtype=dtype)
+                    torch.nn.init.orthogonal_(P)
+                    state['proj'] = P
+                    state['exp_avg'] = torch.zeros(shape[0], eff_rank, dtype=dtype, device=device)
+                    state['exp_avg_sq'] = torch.zeros(shape[0], eff_rank, dtype=dtype, device=device)
                     state['proj_last_step'] = 0
 
                 rank_proj.append(state['proj'])
@@ -538,11 +505,11 @@ class DistGaLoreAdamW(torch.optim.Optimizer):
 
                 if state['step'] % group.get('update_proj_gap', 200) == 0:
                     _, _, Vh = torch.linalg.svd(grad_chunk[i].float(), full_matrices=False)
-                    state['proj'].data.copy_(Vh.T[:, :group.get('rank', 128)].to(dtype))
+                    state['proj'].data.copy_(Vh.T[:, :state['rank']].to(dtype))
 
             for i in range(num_owned):
                 self._step_t.fill_(self.state[owned_params[i]]['step'])
-                # FIX 2: Scale LR instead of parameters
+                # FIX: Scale LR instead of parameters
                 self._lr_t.fill_(group['lr'] * group.get('scale', 0.25))
                 self._beta1_t.fill_(group['betas'][0])
                 self._beta2_t.fill_(group['betas'][1])
@@ -564,7 +531,6 @@ class DistGaLoreAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
-    # FIX 3: Proper distributed AdamW routing
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         param_infos = {}
         for p in group['params']:

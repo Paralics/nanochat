@@ -428,7 +428,7 @@ class GPT(nn.Module):
             case "galore", False:
                 Factory = GaLoreAdam
             case "galore", True:
-                Factory = DistGaLoreAdamW 
+                Factory = GaLoreAdam
             case _, False:
                 Factory = MuonAdamW
             case _, _:
