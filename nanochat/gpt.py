@@ -535,3 +535,65 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+class LoRALinear(nn.Module):
+    """Drop-in Linear replacement with Low-Rank Adaptation. Original weights are frozen."""
+    def __init__(self, linear: nn.Linear, rank: int):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.rank = rank
+        
+        # Freeze original weights
+        self.weight = nn.Parameter(linear.weight.detach().clone(), requires_grad=False)
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
+        else:
+            self.register_parameter('bias', None)
+            
+        # LoRA parameters
+        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features, dtype=linear.weight.dtype, device=linear.weight.device))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank, dtype=linear.weight.dtype, device=linear.weight.device))
+        self._init_lora()
+
+    def _init_lora(self):
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        # Match custom Linear's dtype casting
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        out = F.linear(x, w, b)
+        # LoRA forward: x @ A^T @ B^T
+        lora_out = (x @ self.lora_A.T) @ self.lora_B.T
+        return out + lora_out
+
+    def grow_rank(self, new_rank: int):
+        if new_rank <= self.rank:
+            return
+        old_rank = self.rank
+        new_A = torch.zeros(new_rank, self.in_features, dtype=self.lora_A.dtype, device=self.lora_A.device)
+        new_B = torch.zeros(self.out_features, new_rank, dtype=self.lora_B.dtype, device=self.lora_B.device)
+        
+        # Preserve existing values
+        new_A[:old_rank, :].copy_(self.lora_A.data)
+        new_B[:, :old_rank].copy_(self.lora_B.data)
+        
+        # Initialize only the newly added rows/cols
+        nn.init.kaiming_uniform_(new_A[old_rank:, :], a=math.sqrt(5))
+        nn.init.zeros_(new_B[:, old_rank:])
+        
+        # Replace in-place to keep parameter references intact
+        with torch.no_grad():
+            self.lora_A.data = new_A
+            self.lora_B.data = new_B
+        self.rank = new_rank
+
+def apply_lora_to_model(model: nn.Module, initial_rank: int):
+    """Recursively replace transformer Linear layers with LoRALinear."""
+    for name, module in model.named_modules():
+        if isinstance(module, (Linear, nn.Linear)) and 'transformer.h' in name:
+            parent_name, child_name = name.rsplit('.', 1)
+            parent = model.get_submodule(parent_name)
+            setattr(parent, child_name, LoRALinear(module, initial_rank))

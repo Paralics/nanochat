@@ -80,6 +80,11 @@ parser.add_argument("--optim", type=str, default="muon", choices=["muon", "adam"
 parser.add_argument("--galore-rank", type=int, default=128, help="rank for Galore projection")
 parser.add_argument("--galore-update-interval", type=int, default=100, help="update interval for galore svd")
 parser.add_argument("--galore-scale", type=float, default=0.25, help="LR multiplier for GaLore params relative to full-rank")
+# LoRa
+parser.add_argument("--lora-rank", type=int, default=0, help="Initial LoRA rank (0 = disabled)")
+parser.add_argument("--lora-max-rank", type=int, default=64, help="Maximum LoRA rank for dynamic growth")
+parser.add_argument("--lora-grow-every", type=int, default=1000, help="Steps between LoRA rank increases")
+parser.add_argument("--lora-lr", type=float, default=1e-4, help="Learning rate for LoRA adapters")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -155,6 +160,16 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
+# Apply Dynamic LoRA if enabled
+if args.lora_rank > 0:
+    from nanochat.gpt import apply_lora_to_model, LoRALinear
+    apply_lora_to_model(model, args.lora_rank)
+    
+    # Freeze all non-LoRA parameters
+    for name, param in model.named_parameters():
+        if 'lora_' not in name:
+            param.requires_grad = False
+    print0(f"=== Applied LoRA (initial_rank={args.lora_rank}) ===")
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -248,7 +263,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.lora_rank == 0:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+else:
+    model = torch.compile(model, dynamic=True) # lora changes shapes, so must use dynamic
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -308,22 +326,27 @@ weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * 
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    optim=args.optim,
-    # GaLore hyperparameters
-    galore_rank=args.galore_rank,
-    galore_update_interval=args.galore_update_interval,
-    galore_scale=args.galore_scale
-)
+if args.lora_rank > 0:
+    lora_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        lora_params, 
+        lr=args.lora_lr, 
+        betas=(0.9, 0.95), 
+        weight_decay=0.01
+    )
+    print0(f"Initialized AdamW optimizer for {len(lora_params)} LoRA parameter tensors.")
+else:
+    optimizer = model.setup_optimizer(
+        unembedding_lr=args.unembedding_lr * batch_lr_scale,
+        embedding_lr=args.embedding_lr * batch_lr_scale,
+        scalar_lr=args.scalar_lr * batch_lr_scale,
+        matrix_lr=args.matrix_lr * batch_lr_scale,
+        weight_decay=weight_decay_scaled,
+        optim=args.optim,
+        galore_rank=args.galore_rank,
+        galore_update_interval=args.galore_update_interval,
+        galore_scale=args.galore_scale
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -482,7 +505,25 @@ while True:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
-
+    # Dynamic LoRA Rank Growth
+    if args.lora_rank > 0 and args.lora_max_rank > args.lora_rank:
+        current_rank = max(m.rank for m in model.modules() if isinstance(m, LoRALinear))
+        if step > 0 and step % args.lora_grow_every == 0 and current_rank < args.lora_max_rank:
+            new_rank = min(current_rank * 2, args.lora_max_rank)  # Exponential growth (8->16->32->64)
+            print0(f"⬆️ Growing LoRA rank from {current_rank} to {new_rank}")
+            
+            for m in model.modules():
+                if isinstance(m, LoRALinear):
+                    m.grow_rank(new_rank)
+                    
+            # Clear optimizer state for LoRA params (shapes changed, must re-init moments)
+            for p in model.parameters():
+                if p.requires_grad and p in optimizer.state:
+                    del optimizer.state[p]
+                    
+            # Reset dynamo cache if using torch.compile with shape changes
+            if hasattr(torch, '_dynamo'):
+                torch._dynamo.reset()
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
