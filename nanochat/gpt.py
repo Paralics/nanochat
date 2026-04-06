@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW, DistMuonAdamW, GaLoreAdam
+from nanochat.optim import MuonAdamW, DistMuonAdamW, GaLoreAdam, DistGaLoreAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -367,6 +367,7 @@ class GPT(nn.Module):
 
     # TODO (GaLore): extend setup_optimizer(...) signature with GaLore config (rank, update interval, etc.).
     # TODO (GaLore): keep defaults such that GaLore is disabled and current optimizer behavior remains unchanged.
+
     def setup_optimizer(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, 
         optim="muon", galore_update_interval=None, galore_rank=None, galore_scale=None
@@ -401,6 +402,7 @@ class GPT(nn.Module):
         # Muon groups (matrix params, grouped by shape for stacking)
         match optim:
             case "muon":
+                print("==== Using muon ====")
                 for shape in sorted({p.shape for p in matrix_params}):
                     group_params = [p for p in matrix_params if p.shape == shape]
                     param_groups.append(dict(
@@ -408,11 +410,13 @@ class GPT(nn.Module):
                         momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
                     ))
             case "adam":
+                print("==== Using AdamW ====")
                 param_groups.append(dict(
                     kind='adamw', params=matrix_params, lr=matrix_lr,
                     betas=(0.9, 0.95), eps=1e-10, weight_decay=weight_decay
                 ))
             case "galore":
+                print("==== Using GaLore ====")
                 for shape in sorted({p.shape for p in matrix_params}):
                     group_params = [p for p in matrix_params if p.shape == shape]
                     param_groups.append(dict(
@@ -421,8 +425,10 @@ class GPT(nn.Module):
                         rank=galore_rank, update_proj_gap=galore_update_interval, scale=galore_scale
                     ))
         match optim, ddp:
-            case "galore", _:
+            case "galore", False:
                 Factory = GaLoreAdam
+            case "galore", True:
+                Factory = DistGaLoreAdamW 
             case _, False:
                 Factory = MuonAdamW
             case _, _:
