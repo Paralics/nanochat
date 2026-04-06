@@ -24,6 +24,7 @@ dependencies = [
     "uvicorn>=0.36.0",
     "wandb>=0.22.3",
     "zstandard>=0.25.0",
+    # TODO (GaLore): add GaLore dependency here (or document the vendored/local import path) once you pick an implementation source.
 ]
 
 [dependency-groups]

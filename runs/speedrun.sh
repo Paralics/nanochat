@@ -43,6 +43,8 @@ fi
 # During the course of the run, we will be writing markdown reports to the report/
 # directory in the base dir. This command clears it out and writes a header section
 # with a bunch of system info and a timestamp that marks the start of the run.
+# TODO (GaLore): enable GaLore from this script by appending GaLore CLI args (e.g. from $GALORE_ARGS env var)
+# to the `scripts.base_train` and `scripts.chat_sft` torchrun commands below.
 python -m nanochat.report reset
 
 # -----------------------------------------------------------------------------

@@ -52,6 +52,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
+# TODO (GaLore): add GaLore enable/disable + hyperparameter CLI flags here (matrix params only), defaulting to disabled.
 parser.add_argument("--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR")
 # Evaluation / checkpointing
 parser.add_argument("--eval-every", type=int, default=60, help="evaluate pass@k every N steps")
@@ -199,6 +200,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    # TODO (GaLore): pass GaLore config into model.setup_optimizer(...) so matrix param groups use GaLore-enabled updates.
 )
 
 # Set the initial learning rate as a fraction of the base learning rate
@@ -297,6 +299,8 @@ for step in range(num_steps):
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        # TODO (GaLore): if GaLore-matrix groups require extra per-step scheduling (momentum/weight_decay/update interval),
+        # add it here; RL currently only updates lr.
     optimizer.step()
     model.zero_grad(set_to_none=True)
     wandb_run.log({

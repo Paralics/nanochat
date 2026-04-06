@@ -74,6 +74,8 @@ for d in "${DEPTHS[@]}"; do
         --core-metric-max-per-task=-1 \
         --sample-every=-1 \
         --save-every=-1 \
+        # TODO (GaLore): optionally append GaLore CLI args to enable GaLore for matrix params.
+        # e.g. add `$GALORE_ARGS` in the final argument list and plumb it into the base_train parser.
         $DEVICE_BATCH_SIZE_ARG \
         2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 

@@ -52,6 +52,8 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    # TODO (GaLore): verify GaLore projection/subspace state is included in `optimizer.state_dict()` and is sharded
+    # in a way that is compatible with this per-rank checkpointing (and with `world_size` changes on resume).
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")

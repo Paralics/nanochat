@@ -21,6 +21,9 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
 
+# TODO (GaLore): optionally set GaLore CLI args for the matrix-param optimizer in the base_train/chat_sft commands
+# (e.g. via a $GALORE_ARGS env var you append to the commands below).
+
 # train tokenizer on ~2B characters (~34 seconds on my MacBook Pro M3 Max)
 python -m nanochat.dataset -n 8
 python -m scripts.tok_train --max-chars=2000000000

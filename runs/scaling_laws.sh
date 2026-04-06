@@ -77,6 +77,7 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             --core-metric-max-per-task=-1 \
             --sample-every=-1 \
             --save-every=-1 \
+            # TODO (GaLore): optionally append GaLore CLI args (e.g. $GALORE_ARGS) to run GaLore ablations within scaling_laws.
             2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 
         END_TIME=$(date +%s)

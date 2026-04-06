@@ -53,6 +53,8 @@ parser.add_argument("--total-batch-size", type=int, default=None, help="total ba
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--matrix-lr", type=float, default=None, help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)")
+# TODO (GaLore): add GaLore enable/disable + hyperparameter CLI flags here (matrix params only), defaulting to disabled to preserve current behavior.
+# TODO (GaLore): make sure SFT inherits/overrides GaLore config consistently with how it inherits lrs from the pretrained checkpoint.
 parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
@@ -132,6 +134,7 @@ token_bytes = get_token_bytes(device=device)
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
 optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+# TODO (GaLore): pass GaLore config into model.setup_optimizer(...) so Muon/matrix param groups are GaLore-enabled (and so checkpoint warm-start restores GaLore state correctly).
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -146,6 +149,7 @@ if args.load_optimizer:
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
+        # TODO (GaLore): verify any GaLore-specific group metadata (e.g. update interval/rank) is not accidentally overwritten by load_state_dict.
         print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
@@ -445,6 +449,7 @@ while True:
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
+            # TODO (GaLore): include GaLore-matrix param groups in momentum scheduling (currently gated on kind=='muon').
             group["momentum"] = muon_momentum
     if scaler is not None:
         scaler.unscale_(optimizer)
