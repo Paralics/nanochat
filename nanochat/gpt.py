@@ -13,6 +13,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -552,8 +553,8 @@ class LoRALinear(nn.Module):
             self.register_parameter('bias', None)
             
         # LoRA parameters
-        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features, dtype=linear.weight.dtype, device=linear.weight.device))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank, dtype=linear.weight.dtype, device=linear.weight.device))
+        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features, dtype=COMPUTE_DTYPE, device=linear.weight.device))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank, dtype=COMPUTE_DTYPE, device=linear.weight.device))
         self._init_lora()
 
     def _init_lora(self):
