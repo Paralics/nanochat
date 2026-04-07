@@ -334,6 +334,8 @@ if args.lora_rank > 0:
         betas=(0.9, 0.95), 
         weight_decay=0.01
     )
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
     print0(f"Initialized AdamW optimizer for {len(lora_params)} LoRA parameter tensors.")
 else:
     optimizer = model.setup_optimizer(
@@ -573,10 +575,10 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            # TODO (GaLore): include GaLore-matrix param groups in momentum/weight_decay scheduling (if GaLore introduces new `kind` values).
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
+        if args.lora_rank == 0:
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
